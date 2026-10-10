@@ -1,0 +1,249 @@
+function plotting_gait_events()
+
+%% =======================
+% LOAD CSV
+%% =======================
+filename = 'walk_normal_3.csv';
+raw = readtable(filename,'FileType','text','Delimiter',';', ...
+    'NumHeaderLines',6,'ReadVariableNames',false);
+
+numRows = height(raw);
+allData = cell(numRows,1);
+maxCols = 0;
+
+for r = 1:numRows
+    parts = strsplit(raw.Var1{r}, ',');
+    rowVals = NaN(1,numel(parts));
+    for k = 1:numel(parts)
+        if ~isempty(parts{k})
+            rowVals(k) = str2double(parts{k});
+        end
+    end
+    allData{r} = rowVals;
+    maxCols = max(maxCols, numel(rowVals));
+end
+
+data = NaN(numRows,maxCols);
+for r = 1:numRows
+    data(r,1:numel(allData{r})) = allData{r};
+end
+
+%% =======================
+% IMU — Gyro X
+%% =======================
+gx = -data(:,49);
+gx = fillmissing(gx,'nearest');
+
+fsIMU = 148;
+[b,a] = butter(2,6/(fsIMU/2),'low');
+gxF = filtfilt(b,a,gx);
+
+tIMU = (0:length(gxF)-1)'/fsIMU;
+absG = abs(gxF);
+
+%% =======================
+% APA + Gait start (IDENTICAL)
+%% =======================
+th_APA  = 5;
+th_GAIT = 20;
+
+idxAPA = find(absG > th_APA,1,'first');
+idxGait = find(absG > th_GAIT & (1:length(absG))' > idxAPA,1,'first');
+
+if isempty(idxAPA) || isempty(idxGait)
+    error('APA or gait start not detected');
+end
+
+%% =======================
+% Step detection — MSw
+%% =======================
+gxGait = gxF(idxGait:end);
+
+[~,locMSw_rel] = findpeaks(gxGait, ...
+    'MinPeakHeight',0.4*max(gxGait), ...
+    'MinPeakDistance',round(0.4*fsIMU));
+
+locMSw = locMSw_rel + idxGait - 1;
+nSteps = numel(locMSw);
+
+%% =======================
+% INIT EVENTS (same struct)
+%% =======================
+events = struct('TO1',[],'TO2',[],'MSw',[],'HS1',[], ...
+                'FF',[],'MSt',[],'HO',[]);
+allEvents = repmat(events,nSteps,1);
+
+%% =======================
+% PASS 1 — TO1, TO2, MSw, HS1
+%% =======================
+for s = 1:nSteps
+
+    iMSw = locMSw(s);
+    allEvents(s).MSw = iMSw;
+
+    if s == 1
+        iPrev = idxGait;
+    else
+        iPrev = locMSw(s-1);
+    end
+
+    if s == nSteps
+        iNext = length(gxF);
+    else
+        iNext = locMSw(s+1);
+    end
+
+    % TO1 — deepest negative valley before MSw
+    if iMSw - iPrev >= 3
+        seg = -gxF(iPrev:iMSw);
+        [pks,locs] = findpeaks(seg);
+        if ~isempty(pks)
+            [~,id] = max(pks);
+            allEvents(s).TO1 = iPrev + locs(id) - 1;
+        end
+    end
+
+    % TO2 — first zero crossing TO1 → MSw
+    iTO1 = allEvents(s).TO1;
+    if ~isempty(iTO1) && iMSw > iTO1+1
+        z = gxF(iTO1:iMSw);
+        zc = find(z(1:end-1).*z(2:end) <= 0,1,'first');
+        if ~isempty(zc)
+            allEvents(s).TO2 = iTO1 + zc - 1;
+        end
+    end
+
+    % HS1 — first negative valley after MSw
+    if iNext - iMSw >= 3
+        seg2 = -gxF(iMSw:iNext);
+        [pks2,locs2] = findpeaks(seg2);
+        if ~isempty(pks2)
+            allEvents(s).HS1 = iMSw + locs2(1) - 1;
+        end
+    end
+end
+
+%% =======================
+% PASS 2 — FF, MSt, HO (STANCE WINDOW)
+%% =======================
+dw = [0; diff(gxF)];
+epsFF = 10;
+slopeEps = 2;
+minSamples = max(3, round(0.05*fsIMU));
+
+for s = 1:nSteps-1
+
+    iHS1  = allEvents(s).HS1;
+    iTO1n = allEvents(s+1).TO1;
+
+    if isempty(iHS1) || isempty(iTO1n) || iTO1n <= iHS1+2
+        continue;
+    end
+
+    win = iHS1:iTO1n;
+    sig = gxF(win);
+    dws = dw(win);
+
+    % FF — stable near-zero plateau
+    cond = (abs(sig) < epsFF) & (abs(dws) < slopeEps);
+    if any(cond)
+        d = diff([0; cond; 0]);
+        rs = find(d==1);
+        re = find(d==-1)-1;
+        lens = re-rs+1;
+        good = find(lens>=minSamples,1,'first');
+        if ~isempty(good)
+            allEvents(s).FF = win(rs(good));
+        end
+    end
+
+    % MSt — closest to zero
+    [~,id0] = min(abs(sig));
+    allEvents(s).MSt = win(id0);
+
+    % HO — after MSt: gx<0 AND slope>0
+    iMSt = allEvents(s).MSt;
+    if ~isempty(iMSt)
+        for k = iMSt:iTO1n
+            if gxF(k) < 0 && dw(k) > 0
+                allEvents(s).HO = k;
+                break;
+            end
+        end
+    end
+end
+
+%% =======================
+% PLOT (same as before)
+%% =======================
+figure( ...
+    'Color','w', ...
+    'Units','pixels', ...
+    'Position',[100 100 1700 500] ...
+);
+
+ax = axes();          
+hold(ax,'on');
+grid(ax,'on');
+
+plot(ax, tIMU, gxF, ...
+    'Color','k', ...
+    'LineWidth',1.2);
+
+for s = 1:nSteps
+    plotEventWithText(tIMU, gxF, allEvents(s).MSw, 'MSw','o',[0 0.6 0]);
+    plotEventWithText(tIMU, gxF, allEvents(s).TO2, 'TO2','^',[0 0.3 1]);
+    plotEventWithText(tIMU, gxF, allEvents(s).HS1, 'HS1','s',[0 0 0]);
+    plotEventWithText(tIMU, gxF, allEvents(s).TO1, 'TO1','v',[1 0 0]);
+
+    % stance events (if detected)
+    plotEventWithText(tIMU, gxF, allEvents(s).FF,  'FF','d',[0 0.7 0.7]);
+    plotEventWithText(tIMU, gxF, allEvents(s).MSt, 'MSt','p',[0.6 0 0.6]);
+    plotEventWithText(tIMU, gxF, allEvents(s).HO,  'HO','<',[1 0.5 0]);
+    plotEventWithText(ax, tIMU, gxF, allEvents(s).MSw, 'MSw','o',[0 0.6 0]);
+end
+
+xlabel('Time (s)','FontSize',12);
+ylabel('Angular Velocity (deg/s)','FontSize',12);
+title('Gyro X – Sit-to-Walk and Gait Events','FontSize',13);
+
+set(gca, ...
+    'FontSize',11, ...
+    'LineWidth',1.2, ...
+    'GridAlpha',0.25);
+
+xline(ax, tAPA_start, ...
+    'Color',[0 0.4 1], ...
+    'LineWidth',2, ...
+    'Label','Sit-to-Walk', ...
+    'LabelOrientation','vertical', ...
+    'LabelHorizontalAlignment','right');
+
+xline(ax, tGait_start, ...
+    'Color',[1 0 0], ...
+    'LineWidth',2, ...
+    'Label','Gait Start', ...
+    'LabelOrientation','vertical', ...
+    'LabelHorizontalAlignment','right');
+
+
+function plotEventWithText(ax,t,sig,idx,label,marker,color)
+if isempty(idx) || isnan(idx)
+    return;
+end
+plot(ax,t(idx), sig(idx), marker, ...
+    'MarkerSize',10, ...
+    'MarkerFaceColor',color, ...
+    'MarkerEdgeColor',color);
+
+text(ax,t(idx)+0.03, sig(idx), label, ...
+    'Color',color, ...
+    'FontSize',10, ...
+    'FontWeight','bold');
+end
+
+xlim(ax, [tGait_start-0.3, tGait_start+15]);
+ylim(ax, [-450 450]);
+set(gca,'XLimMode','manual','YLimMode','manual');
+
+end

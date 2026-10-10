@@ -1,0 +1,181 @@
+clear; clc; close all;
+disp('LSTM SCRIPT STARTED');
+
+%% ================================
+% SETTINGS
+%% ================================
+rootFolder = 'C:\Users\user\Documents\Graduation Project\GaitEventsDetection';
+
+eventNames = {'TO1','MSw','HS1'};
+numClasses = numel(eventNames);
+
+subjects = dir(fullfile(rootFolder,'S*'));
+subjects = subjects([subjects.isdir]);
+[~,idx] = sort({subjects.name});
+subjects = subjects(idx);
+totalSubjects = length(subjects);
+disp(totalSubjects)
+
+rng(1)  % for reproducibility
+
+idx = randperm(totalSubjects);
+trainIdx = idx(1:55);
+testIdx  = idx(56:end);
+
+XTrain = {};
+YTrain = {};
+
+XTest = {};
+YTest = {};
+
+%% ================================
+% LOOP THROUGH SUBJECTS
+%% ================================
+for s = 1:length(subjects)
+
+    subjPath = fullfile(subjects(s).folder, subjects(s).name);
+    walks = dir(fullfile(subjPath,'walk*'));
+
+    for w = 1:length(walks)
+
+        walkPath = fullfile(walks(w).folder, walks(w).name);
+
+        allSeqFeatures = [];
+        allSeqLabels   = [];
+
+        for e = 1:numClasses
+
+            filePath = fullfile(walkPath,[eventNames{e} '.xlsx']);
+            if ~isfile(filePath)
+                continue
+            end
+
+            T = readtable(filePath);
+
+            validRows = find(~isnan(T.TA_RMS));
+            if isempty(validRows)
+                continue
+            end
+
+            featMask = contains(T.Properties.VariableNames,...
+                {'_RMS','_IEMG','_MAV','_WL','_ZC','_SSC','_PF','_TP'});
+
+            F = T{validRows, featMask};
+
+            steps = T.Step(validRows);
+            segments = T.Segment(validRows);
+
+            tmp = table;
+            tmp.Features = num2cell(F,2);
+            tmp.Step = steps;
+            tmp.Segment = segments;
+            tmp.Label = repmat(e,length(validRows),1);
+
+            if exist('allData','var')
+                allData = [allData; tmp];
+            else
+                allData = tmp;
+            end
+        end
+
+        if ~exist('allData','var') || isempty(allData)
+            continue
+        end
+
+        % Sort chronologically
+        allData = sortrows(allData,{'Step','Segment'});
+
+        seqFeatures = cell2mat(allData.Features);
+        seqLabels   = allData.Label;
+
+        if size(seqFeatures,1) < 5
+            clear allData
+            continue
+        end
+
+        % Shift for next-event prediction
+        Xseq = seqFeatures(1:end-1,:)';
+        Yseq = categorical(seqLabels(2:end))';
+
+        if ismember(s, trainIdx)
+            XTrain{end+1} = Xseq;
+            YTrain{end+1} = Yseq;
+        elseif ismember(s, testIdx)
+            XTest{end+1} = Xseq;
+            YTest{end+1} = Yseq;
+        end
+
+        clear allData
+    end
+end
+
+%% ================================
+% NORMALIZATION (TRAIN ONLY)
+%% ================================
+allTrainData = cat(2,XTrain{:});
+minX = min(allTrainData,[],2);
+maxX = max(allTrainData,[],2);
+
+for i=1:length(XTrain)
+    XTrain{i} = (XTrain{i} - minX) ./ (maxX - minX + eps);
+end
+
+for i=1:length(XTest)
+    XTest{i} = (XTest{i} - minX) ./ (maxX - minX + eps);
+end
+
+%% ================================
+% DEFINE LSTM NETWORK
+%% ================================
+numFeatures = 64;   % 8 muscles × 8 features
+numHiddenUnits = 128;
+numClasses = 3;     % TO1, MSw, HS1
+
+layers = [
+    sequenceInputLayer(numFeatures)
+    lstmLayer(numHiddenUnits,'OutputMode','sequence')
+    fullyConnectedLayer(numClasses)
+    softmaxLayer
+    classificationLayer];
+
+options = trainingOptions('adam', ...
+    'MaxEpochs',40, ...
+    'MiniBatchSize',32, ...
+    'Shuffle','every-epoch', ...
+    'Verbose',false, ...
+    'Plots','training-progress');
+
+disp('Number of training sequences:')
+disp(length(XTrain))
+
+disp('Number of training label sequences:')
+disp(length(YTrain))
+
+%% ================================
+% TRAIN NETWORK
+%% ================================
+net = trainNetwork(XTrain,YTrain,layers,options);
+
+%% ================================
+% TEST NETWORK
+%% ================================
+YPred = classify(net,XTest,'MiniBatchSize',1);
+
+%% ================================
+% EVALUATION
+%% ================================
+totalCorrect = 0;
+totalCount = 0;
+
+for i = 1:numel(YPred)
+    totalCorrect = totalCorrect + sum(YPred{i} == YTest{i});
+    totalCount   = totalCount + numel(YTest{i});
+end
+
+accuracy = totalCorrect / totalCount * 100;
+
+fprintf('LSTM Test Accuracy = %.2f %%\n',accuracy);
+
+figure;
+confusionchart(YTest,YPred);
+title('LSTM Next Event Prediction');

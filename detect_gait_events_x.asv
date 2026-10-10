@@ -1,0 +1,216 @@
+function detect_gait_events_x()
+%% =======================
+% 1. Load CSV
+% =======================
+filename = 'walk_normal_3.csv';
+raw = readtable(filename, 'FileType','text', ...
+'Delimiter',';', 'NumHeaderLines',6, ...
+'ReadVariableNames',false);
+numRows = height(raw);
+allData = cell(numRows,1);
+maxCols = 0;
+for r = 1:numRows
+parts = strsplit(raw.Var1{r}, ',');
+parts = strtrim(parts);
+rowVals = NaN(1, numel(parts));
+for k = 1:numel(parts)
+if ~isempty(parts{k})
+rowVals(k) = str2double(parts{k});
+end
+end
+allData{r} = rowVals;
+maxCols = max(maxCols, numel(rowVals));
+end
+data = NaN(numRows, maxCols);
+for r = 1:numRows
+L = length(allData{r});
+data(r,1:L) = allData{r};
+end
+%% =======================
+% 2. Extract Gyro X (correct gait axis)
+% =======================
+gx = -data(:,49);
+gx = fillmissing(gx,'nearest');
+%% =======================
+% 3. Filter + crop movement
+% =======================
+fs = 148;
+[b,a] = butter(2, 6/(fs/2), 'low');
+gxF = filtfilt(b,a, gx);
+gxF_full = gxF;
+tFull = (0:length(gxF_full)-1)'/fs;
+th_APA = 5; % Sit-to-walk threshold
+th_GAIT = 20; % Gait threshold
+minDur = round(0.2 * fs); % 200 ms consistency
+absG = abs(gxF);
+% --- Sit-to-Walk (APA) start ---
+idxAPA = find(absG > th_APA);
+idxAPA = idxAPA([true; diff(idxAPA) == 1]); % continuous
+iAPA = idxAPA(1);
+% --- Gait start ---
+idxGait = find(absG > th_GAIT & (1:length(absG))' > iAPA);
+iGait = idxGait(1);
+tAPA_start = tFull(iAPA);
+tGait_start = tFull(iGait);
+tAPA_dur = tGait_start - tAPA_start;
+fprintf('\nSit-to-Walk detected:\n');
+fprintf(' APA start = %.3f s\n', tAPA_start);
+fprintf(' Gait start = %.3f s\n', tGait_start);
+fprintf(' Duration = %.3f s\n\n', tAPA_dur);
+%% =======================
+% 3b. Crop ONLY from gait start
+% =======================
+gxF = gxF(iGait:end);
+t = (0:length(gxF)-1)'/fs;
+%% =======================
+% 4. Step detection (MSw peaks)
+% =======================
+minPkHeight = 0.4*max(gxF);
+minPkDist = round(0.4*fs);
+[pkMSw, locMSw] = findpeaks(gxF, ...
+'MinPeakHeight',minPkHeight, ...
+'MinPeakDistance',minPkDist);
+nSteps = numel(locMSw);
+fprintf('Detected %d steps.\n', nSteps);
+%% =======================
+% 5. Gait events per step
+% =======================
+events = struct('TO1',[],'MSw',[],'HS1',[],'TO2',[], ...
+'FF',[],'HO',[],'MSt',[],'HS2',[]);
+allEvents = repmat(events, nSteps, 1);
+for s = 1:nSteps
+iMSw = locMSw(s);
+allEvents(s).MSw = iMSw;
+if s==1
+iPrev = 1;
+else
+iPrev = locMSw(s-1);
+end
+if s==nSteps
+iNext = length(gxF);
+else
+iNext = locMSw(s+1);
+end
+%% TO1 (largest negative before MSw)
+%[negPk1, negLoc1] = findpeaks(-gxF(iPrev:iMSw));
+%if ~isempty(negPk1)
+%[~, idxDeep] = max(negPk1);
+%iTO1 = iPrev + negLoc1(idxDeep) - 1;
+%else
+%iTO1 = NaN;
+%end
+%allEvents(s).TO1 = iTO1;
+if ~isempty(iTO1) && prevEndIMU <= iTO1
+phaseDefs(end+1,:) = {'TO1', prevEndIMU, iTO1};
+end
+%% HS1 (first negative valley after MSw)
+[negPk2, negLoc2] = findpeaks(-gxF(iMSw:iNext));
+if ~isempty(negPk2)
+iHS1 = iMSw + negLoc2(1) - 1;
+else
+iHS1 = NaN;
+end
+allEvents(s).HS1 = iHS1;
+%% TO2 (zero crossing between TO1→MSw)
+iTO2 = NaN;
+if ~isnan(iTO1)
+seg = gxF(iTO1:iMSw);
+zc = find(seg.*circshift(seg,-1) <= 0, 1, 'first');
+if ~isempty(zc)
+iTO2 = iTO1 + zc - 1;
+end
+end
+allEvents(s).TO2 = iTO2;
+%% FF (near-zero between HS1→TO1)
+epsFF = 50;
+iFF = NaN;
+if ~isnan(iHS1) && ~isnan(iTO1)
+for k = iHS1:iTO1
+if abs(gxF(k)) < epsFF
+iFF = k;
+break;
+end
+end
+end
+allEvents(s).FF = iFF;
+%% HO (first negative after FF)
+iHO = NaN;
+if ~isnan(iFF)
+for k = iFF:iTO1
+if gxF(k) < -epsFF/2
+iHO = k;
+break;
+end
+end
+end
+allEvents(s).HO = iHO;
+%% MSt (closest to zero HS1→TO1)
+iMSt = NaN;
+if ~isnan(iHS1) && ~isnan(iTO1)
+stanceSeg = gxF(iHS1:iTO1);
+[~, idx] = min(abs(stanceSeg));
+iMSt = iHS1 + idx - 1;
+end
+allEvents(s).MSt = iMSt;
+end
+eventNames = {'TO1','MSw','HS1','TO2','FF','HO','MSt'};
+eventTable = [];
+for s = 1:nSteps
+ev = allEvents(s);
+for e = 1:length(eventNames)
+name = eventNames{e};
+idx = ev.(name);
+if ~isempty(idx) && isfinite(idx)
+tEvent = t(idx);
+vEvent = gxF(idx);
+else
+tEvent = NaN;
+vEvent = NaN;
+end
+eventTable = [eventTable;
+{s, name, idx, tEvent, vEvent} ];
+end
+end
+eventTable = cell2table(eventTable, ...
+'VariableNames', {'Step','Event','Sample','Time_sec','Velocity_deg_per_s'});
+disp(eventTable);
+%% =======================
+% 6. Plot events
+% =======================
+figure;
+plot(tFull, gxF_full, 'k-', 'LineWidth', 1.2);
+hold on; grid on;
+% --- APA & Gait markers ---
+xline(tAPA_start, 'b', 'Sit-to-Walk', 'LineWidth', 2);
+xline(tGait_start, 'r', 'Gait Start', 'LineWidth', 2);
+% --- Plot gait events on SAME axis ---
+for s = 1:nSteps
+ev = allEvents(s);
+plotEventFull(tFull, gxF_full, ev.MSw, iGait, 'MSw', 'o', [0 0.6 0]);
+plotEventFull(tFull, gxF_full, ev.TO1, iGait, 'TO1', 'v', 'r');
+plotEventFull(tFull, gxF_full, ev.HS1, iGait, 'HS1', 's', 'k');
+plotEventFull(tFull, gxF_full, ev.TO2, iGait, 'TO2', '^', 'b');
+end
+xlabel('Time (s)');
+ylabel('Angular Velocity (deg/s)');
+title('Gyro X – Sit-to-Walk and Gait Events');
+xlim([tAPA_start - 1, tGait_start + 15])
+hold off;
+end % ========== end main function ==========
+%% =======================
+% Helper: plot event
+% =======================
+function plotEventFull(tFull, sigFull, idxCropped, iGait, label, marker, color)
+if isempty(idxCropped) || isnan(idxCropped)
+return;
+end
+idxFull = idxCropped + iGait - 1;
+if idxFull >= 1 && idxFull <= length(sigFull)
+plot(tFull(idxFull), sigFull(idxFull), marker, ...
+'MarkerSize',10, ...
+'MarkerFaceColor',color, ...
+'MarkerEdgeColor',color);
+text(tFull(idxFull)+0.02, sigFull(idxFull), label, ...
+'Color',color,'FontSize',9);
+end
+end

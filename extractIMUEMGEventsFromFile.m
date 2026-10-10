@@ -1,0 +1,468 @@
+function extractIMUEMGEventsFromFile(filename, trialOutFolder, max_cont)
+
+%% =========================================================
+% EVENT DEFINITIONS (single source of truth)
+%% =========================================================
+eventNames = {'TO1','TO2','MSw','HS1','FF','MSt','HO'};
+
+%% =======================
+% LOAD CSV
+%% =======================
+raw = readtable(filename,'FileType','text','Delimiter',';', ...
+    'NumHeaderLines',6,'ReadVariableNames',false);
+
+numRows = height(raw);
+allData = cell(numRows,1);
+maxCols = 0;
+
+for r = 1:numRows
+    parts = strsplit(raw.Var1{r}, ',');
+    rowVals = NaN(1,numel(parts));
+    for k = 1:numel(parts)
+        if ~isempty(parts{k})
+            rowVals(k) = str2double(parts{k});
+        end
+    end
+    allData{r} = rowVals;
+    maxCols = max(maxCols, numel(rowVals));
+end
+
+data = NaN(numRows,maxCols);
+for r = 1:numRows
+    data(r,1:numel(allData{r})) = allData{r};
+end
+
+%% =======================
+% IMU PROCESSING
+%% =======================
+gx = -data(:,49);
+gx = fillmissing(gx,'nearest');
+fsIMU = 148;
+
+[b,a] = butter(2,6/(fsIMU/2),'low');
+gxF = filtfilt(b,a,gx);
+tIMU = (0:length(gxF)-1)'/fsIMU;
+absG = abs(gxF);
+
+%% =======================
+% EMG PREPROCESSING
+%% =======================
+rawEMG = {data(:,1),data(:,8),data(:,9),data(:,16), ...
+          data(:,23),data(:,24),data(:,31),data(:,38)};
+
+fsOrig = [1259 1778 1778 1259 1778 1778 1259 1259];
+fsEMG = 1778;
+
+EMG = cell(1,8);
+EMG_raw_noRect = cell(1,8);
+
+for m=1:8
+    x = rawEMG{m};
+    x(~isfinite(x)) = 0;
+    x = resample(x, fsEMG, fsOrig(m));
+    x = emgBandpass(x, fsEMG);
+    x = emgNotch(x, fsEMG);
+
+    EMG_raw_noRect{m} = x;
+
+    x = abs(x);
+    if max_cont(m) > 0
+        x = x / max_cont(m);
+    else
+        x = zeros(size(x));
+    end
+    EMG{m} = x;
+end
+
+tEMG = (0:length(EMG{1})-1)'/fsEMG;
+
+%% =======================
+% GLOBAL FREQUENCY FEATURES (PER SUBJECT)
+%% =======================
+PF_global = zeros(1,8);
+TP_global = zeros(1,8);
+
+for m = 1:8
+    x = EMG{m};
+
+    if numel(x) < 8 || all(x==0)
+        PF_global(m) = NaN;
+        TP_global(m) = NaN;
+        continue;
+    end
+
+    % remove DC offset
+    x = x - mean(x);
+
+    % Welch PSD
+    [Pxx,f] = pwelch(x, fsEMG*2, [], [], fsEMG);
+
+    % Peak Frequency
+    [~,id] = max(Pxx);
+    PF_global(m) = f(id);
+
+    % Total Power
+    TP_global(m) = trapz(f, Pxx);
+end
+
+%% =======================
+% GAIT START DETECTION
+%% =======================
+idxAPA = find(absG > 5,1,'first');
+if isempty(idxAPA); return; end
+
+idxGait = find(absG > 20 & (1:length(absG))' > idxAPA,1,'first');
+if isempty(idxGait); return; end
+
+%% =======================
+% STEP DETECTION
+%% =======================
+gxGait = gxF(idxGait:end);
+
+[~,locMSw_rel] = findpeaks(gxGait,...
+    'MinPeakHeight',0.4*max(gxGait),...
+    'MinPeakDistance',round(0.4*fsIMU));
+
+if isempty(locMSw_rel); return; end
+
+locMSw = locMSw_rel + idxGait - 1;
+nSteps = numel(locMSw);
+
+events = struct('TO1',[],'TO2',[],'MSw',[],'HS1',[],...
+                'FF',[],'MSt',[],'HO',[]);
+allEvents = repmat(events,nSteps,1);
+
+%% =======================
+% PASS 1 EVENTS
+%% =======================
+for s = 1:nSteps
+
+    iMSw = locMSw(s);
+    allEvents(s).MSw = iMSw;
+
+    if s==1; iPrev = idxGait; else; iPrev = locMSw(s-1); end
+    if s==nSteps; iNext = length(gxF); else; iNext = locMSw(s+1); end
+
+    seg = -gxF(iPrev:iMSw);
+    [pks,locs] = findpeaks(seg);
+    if ~isempty(pks)
+        [~,id] = max(pks);
+        allEvents(s).TO1 = iPrev + locs(id) - 1;
+    end
+
+    iTO1 = allEvents(s).TO1;
+    if ~isempty(iTO1)
+        z = gxF(iTO1:iMSw);
+        zc = find(z(1:end-1).*z(2:end)<=0,1);
+        if ~isempty(zc)
+            allEvents(s).TO2 = iTO1 + zc - 1;
+        end
+    end
+
+    seg2 = -gxF(iMSw:iNext);
+    [pks2,locs2] = findpeaks(seg2);
+    if ~isempty(pks2)
+        allEvents(s).HS1 = iMSw + locs2(1) - 1;
+    end
+end
+
+%% =======================
+% PASS 2 — FF, MSt, HO
+%% =======================
+dw = [0; diff(gxF)];
+epsFF = 10;
+slopeEps = 2;
+minSamples = max(3, round(0.05*fsIMU));   % ~50 ms plateau
+
+for s = 1:nSteps-1
+
+    iHS1  = allEvents(s).HS1;
+    iTO1n = allEvents(s+1).TO1;
+
+    if isempty(iHS1) || isempty(iTO1n)
+        continue;
+    end
+
+    if iTO1n <= iHS1 + 2
+        continue;
+    end
+
+    win = iHS1:iTO1n;
+    sig = gxF(win);
+    dws = dw(win);
+
+    % ---- FF: stable near-zero plateau ----
+    cond = (abs(sig) < epsFF) & (abs(dws) < slopeEps);
+
+    if any(cond)
+        d = diff([0; cond; 0]);
+        rs = find(d == 1);
+        re = find(d == -1) - 1;
+        lens = re - rs + 1;
+        good = find(lens >= minSamples, 1, 'first');
+
+        if ~isempty(good)
+            allEvents(s).FF = win(rs(good));
+        end
+    end
+
+    % ---- MSt: closest to zero ----
+    [~,id0] = min(abs(sig));
+    allEvents(s).MSt = win(id0);
+
+    % ---- HO: negative omega + positive slope ----
+    iMSt = allEvents(s).MSt;
+    if ~isempty(iMSt)
+        for k = iMSt:iTO1n
+            if gxF(k) < 0 && dw(k) > 0
+                allEvents(s).HO = k;
+                break;
+            end
+        end
+    end
+end
+%% =======================
+% PREPARE STORAGE
+%% =======================
+eventTables = struct();
+segmentCounter = struct();
+
+for i=1:numel(eventNames)
+    eventTables.(eventNames{i}) = table();
+    segmentCounter.(eventNames{i}) = 1;
+end
+
+prevEndIMU = idxGait;
+
+%% =======================
+% BUILD EVENT SEGMENTS
+%% =======================
+for s=1:nSteps
+
+    e = allEvents(s);
+    phaseDefs = {};
+
+    if ~isempty(e.TO1)
+        phaseDefs(end+1,:)={'TO1',prevEndIMU,e.TO1};
+    end
+    if ~isempty(e.TO1)&&~isempty(e.TO2)
+        phaseDefs(end+1,:)={'TO2',e.TO1+1,e.TO2};
+    end
+    if ~isempty(e.MSw)
+        phaseDefs(end+1,:)={'MSw',e.TO2+1,e.MSw};
+    end
+    if ~isempty(e.MSw)&&~isempty(e.HS1)
+        phaseDefs(end+1,:)={'HS1',e.MSw+1,e.HS1};
+    end
+
+    if ~isempty(e.HS1) && ~isempty(e.FF)
+       phaseDefs(end+1,:) = {'FF', e.HS1+1, e.FF};
+    end
+
+    % MSt
+    if ~isempty(e.FF) && ~isempty(e.MSt)
+       phaseDefs(end+1,:) = {'MSt', e.FF+1, e.MSt};
+    end
+
+    % HO
+    if ~isempty(e.MSt) && ~isempty(e.HO)
+       phaseDefs(end+1,:) = {'HO', e.MSt+1, e.HO};
+    end
+
+    for p=1:size(phaseDefs,1)
+
+        eventName = phaseDefs{p,1};
+        imuStart  = phaseDefs{p,2};
+        imuEnd    = phaseDefs{p,3};
+
+        tStart = tIMU(imuStart);
+        tEnd   = tIMU(imuEnd);
+
+        emgStart = floor(tStart * fsEMG) + 1;
+        emgEnd   = ceil(tEnd * fsEMG);
+
+        % ===== SAFE BOUNDARY CHECK =====
+        emgStart = max(1, emgStart);
+        emgEnd   = min(emgEnd, length(EMG{1}));
+
+        segmentLength = emgEnd - emgStart + 1;
+
+        % skip extremely short segments
+        if segmentLength < 5
+           continue;
+        end
+        
+        % ensure indices exist in ALL muscles
+        minLen = min(cellfun(@length, EMG));
+        if emgEnd > minLen
+        emgEnd = minLen;
+        end
+
+        % recompute length after clipping
+        L = emgEnd - emgStart + 1;
+
+        if L < 5 
+            continue;
+        end
+
+        % ===== Extract EMG segment =====
+        emgMat = NaN(emgEnd-emgStart+1,8);
+        for m=1:8
+            emgMat(:,m) = EMG{m}(emgStart:emgEnd);
+        end
+
+        L = size(emgMat,1);
+        if L < 5
+            fprintf('Skipped short segment at step %d (%s)\n', s, eventName);
+            continue;
+        end
+        EMG_Time = (0:L-1)'/fsEMG;
+
+        %% ===== Feature Extraction =====
+        thr = 0.01 * max(abs(emgMat),[],1);
+
+        % Time-domain features
+        EMG_RMS = sqrt(mean(emgMat.^2,1));
+        IEMG    = sum(abs(emgMat),1);
+        MAV     = mean(abs(emgMat),1);
+
+        if L < 2
+            WL = zeros(1,8);
+        else
+            WL = sum(abs(diff(emgMat)),1);
+        end
+
+        % Zero Crossings (use non-rectified)
+        ZC = zeros(1,8);
+        for m=1:8
+            xraw = EMG_raw_noRect{m};
+            emgEndSafe = min(emgEnd, length(xraw));
+            x = xraw(emgStart:emgEndSafe);
+
+           if numel(x) < 2
+               ZC(m) = 0;
+               continue;
+           end
+
+           ZC(m) = sum( ...
+               (x(1:end-1).*x(2:end) < 0) & ...
+               abs(x(1:end-1)-x(2:end)) > thr(m) ...
+           );
+        end
+
+        % Slope Sign Changes
+        SSC = zeros(1,8);
+        for m=1:8
+            x = emgMat(:,m);
+        if numel(x) < 3
+            SSC(m) = 0;
+            continue;
+        end
+            SSC(m) = sum( ...
+                ((x(2:end-1) > x(1:end-2) & x(2:end-1) > x(3:end)) | ...
+                 (x(2:end-1) < x(1:end-2) & x(2:end-1) < x(3:end))) & ...
+                 abs(x(2:end-1)-x(1:end-2)) > thr(m) & ...
+                 abs(x(2:end-1)-x(3:end)) > thr(m));
+        end
+
+        %% ===== Metadata Columns =====
+        StepCol    = repmat(s,L,1);
+        SegmentCol = repmat(segmentCounter.(eventName),L,1);
+        EventCol   = repmat(string(eventName),L,1);
+        segmentCounter.(eventName) = segmentCounter.(eventName) + 1;
+
+        %% ===== Build Table =====
+        if L <= 0
+            continue;
+        end
+        T = table( ...
+            StepCol, SegmentCol, EventCol, EMG_Time, ...
+            emgMat(:,1), emgMat(:,2), emgMat(:,3), emgMat(:,4), ...
+            emgMat(:,5), emgMat(:,6), emgMat(:,7), emgMat(:,8), ...
+            'VariableNames',{'Step','Segment','Event','Time_s', ...
+            'TA','GM','GL','RF','VL','VM','ST','BF'});
+
+        % store features in FIRST row only
+        addFeature = @(val) [val; nan(max(L-1,0),1)];
+
+        muscles = {'TA','GM','GL','RF','VL','VM','ST','BF'};
+
+        for m = 1:8
+            fvec = addFeature(EMG_RMS(m));
+            if height(T) == numel(fvec)
+                T.([muscles{m} '_RMS']) = fvec;
+            end
+
+            fvec = addFeature(IEMG(m));
+            if height(T) == numel(fvec)
+                T.([muscles{m} '_IEMG']) = fvec;
+            end
+
+            fvec = addFeature(MAV(m));
+            if height(T) == numel(fvec)
+                T.([muscles{m} '_MAV']) = fvec;
+            end
+
+            fvec = addFeature(WL(m));
+            if height(T) == numel(fvec)
+                T.([muscles{m} '_WL']) = fvec;
+            end
+
+            fvec = addFeature(ZC(m));
+            if height(T) == numel(fvec)
+                T.([muscles{m} '_ZC']) = fvec;
+            end
+
+            fvec = addFeature(SSC(m));
+            if height(T) == numel(fvec)
+                T.([muscles{m} '_SSC']) = fvec;
+            end
+
+            fvec = addFeature(PF_global(m));
+            if height(T) == numel(fvec)
+                T.([muscles{m} '_PF']) = fvec;
+            end
+
+            fvec = addFeature(TP_global(m));
+            if height(T) == numel(fvec)
+                T.([muscles{m} '_TP']) = fvec;
+            end
+        end
+
+        % Append to phase table
+        eventTables.(eventName) = [eventTables.(eventName); T];
+    end
+
+    if ~isempty(e.HO)
+    prevEndIMU = e.HO + 1;
+    elseif ~isempty(e.HS1)
+    prevEndIMU = e.HS1 + 1;
+    end
+end
+
+%% =======================
+% SAVE FILES
+%% =======================
+for i=1:numel(eventNames)
+    name = eventNames{i};
+    if ~isempty(eventTables.(name))
+        writetable(eventTables.(name), ...
+            fullfile(trialOutFolder,[name '.xlsx']));
+    end
+end
+
+end
+
+%% =======================
+% FILTER HELPERS
+%% =======================
+function y = emgBandpass(x,fs)
+[b,a]=butter(4,[20 450]/(fs/2),'bandpass');
+y=filtfilt(b,a,x);
+end
+
+function y = emgNotch(x,fs)
+W0=50/(fs/2); BW=W0/35;
+[b,a]=iirnotch(W0,BW);
+y=filtfilt(b,a,x);
+end 
